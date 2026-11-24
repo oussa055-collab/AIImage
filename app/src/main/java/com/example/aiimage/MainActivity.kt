@@ -19,7 +19,9 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import kotlin.concurrent.thread
+import kotlin.math.abs
 
 class MainActivity : Activity() {
 
@@ -35,6 +37,7 @@ class MainActivity : Activity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var keyBox: EditText
     private lateinit var modelBox: EditText
+    private lateinit var geminiBox: CheckBox
     private lateinit var promptBox: EditText
     private lateinit var modeGroup: RadioGroup
     private lateinit var runBtn: Button
@@ -57,26 +60,34 @@ class MainActivity : Activity() {
         }
 
         keyBox = EditText(this).apply {
-            hint = "مفتاح Gemini API"
+            hint = "مفتاح Gemini (اختياري)"
             setText(prefs.getString("key", ""))
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             setSingleLine()
         }
         modelBox = EditText(this).apply {
-            hint = "اسم الموديل"
+            hint = "اسم موديل Gemini"
             setText(prefs.getString("model", DEFAULT_MODEL))
             setSingleLine()
         }
+        geminiBox = CheckBox(this).apply {
+            text = "استعمل Gemini للتوليد (يحتاج حساب مدفوع)"
+            isChecked = prefs.getBoolean("gemini_gen", false)
+        }
 
         modeGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
-        listOf(1 to "توليد صورة من فكرة", 2 to "تحسين صورة (ضوء، ألوان، وضوح)", 3 to "تعديل صورة بالأمر (نحّي / زيد)")
-            .forEach { (id, label) ->
-                modeGroup.addView(RadioButton(this).apply { this.id = id; text = label })
-            }
+        listOf(
+            1 to "توليد صورة من فكرة (مجاني)",
+            2 to "تحسين صورة: ضوء، ألوان، وضوح (مجاني، في التليفون)",
+            3 to "تعديل صورة بالأمر (Gemini، يحتاج حساب مدفوع)",
+            4 to "تحسين بالذكاء الاصطناعي (Gemini، يحتاج حساب مدفوع)"
+        ).forEach { (id, label) ->
+            modeGroup.addView(RadioButton(this).apply { this.id = id; text = label })
+        }
         modeGroup.check(1)
 
         promptBox = EditText(this).apply {
-            hint = "اكتب الفكرة أو الأمر هنا"
+            hint = "اكتب الفكرة أو الأمر هنا (بالإنجليزية أحسن)"
             minLines = 2
         }
 
@@ -100,7 +111,7 @@ class MainActivity : Activity() {
             scaleType = ImageView.ScaleType.FIT_CENTER
         }
 
-        listOf(keyBox, modelBox, modeGroup, promptBox, pickBtn, runBtn, status, preview, saveBtn)
+        listOf(keyBox, modelBox, geminiBox, modeGroup, promptBox, pickBtn, runBtn, status, preview, saveBtn)
             .forEach {
                 root.addView(it, LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -125,7 +136,7 @@ class MainActivity : Activity() {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
         var sample = 1
-        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > maxSide * 2) sample *= 2
+        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > maxSide) sample *= 2
         val opts = BitmapFactory.Options().apply { inSampleSize = sample }
         return contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
     }
@@ -133,39 +144,87 @@ class MainActivity : Activity() {
     private fun setStatus(s: String) { status.text = s }
     private fun setStatusAsync(s: String) { runOnUiThread { setStatus(s) } }
 
-    private fun run() {
-        val key = keyBox.text.toString().trim()
-        val model = modelBox.text.toString().trim().ifEmpty { DEFAULT_MODEL }
-        prefs.edit().putString("key", key).putString("model", model).apply()
-
-        val mode = modeGroup.checkedRadioButtonId
-        val userPrompt = promptBox.text.toString().trim()
-        val img = inputBitmap
-
-        if (key.isEmpty()) { setStatus("حط مفتاح Gemini أولا"); return }
-        if (mode == 1 && userPrompt.isEmpty()) { setStatus("اكتب الفكرة"); return }
-        if (mode != 1 && img == null) { setStatus("اختار تصويرة أولا"); return }
-        if (mode == 3 && userPrompt.isEmpty()) { setStatus("اكتب شنو تحب تبدّل"); return }
-
-        val prompt = if (mode == 2) ENHANCE_PROMPT + (if (userPrompt.isNotEmpty()) " $userPrompt" else "") else userPrompt
-
+    private fun runAsync(work: () -> Bitmap) {
         runBtn.isEnabled = false
         saveBtn.isEnabled = false
         setStatus("نخدم... (ممكن ياخذ دقيقة)")
         thread {
             try {
-                val bmp = callGemini(key, model, prompt, if (mode == 1) null else img)
+                val bmp = work()
                 runOnUiThread {
                     resultBitmap = bmp
                     preview.setImageBitmap(bmp)
                     saveBtn.isEnabled = true
                     setStatus("خلصت ✅")
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 setStatusAsync("خطأ: ${e.message}")
             } finally {
                 runOnUiThread { runBtn.isEnabled = true }
             }
+        }
+    }
+
+    private fun run() {
+        val key = keyBox.text.toString().trim()
+        val model = modelBox.text.toString().trim().ifEmpty { DEFAULT_MODEL }
+        prefs.edit()
+            .putString("key", key)
+            .putString("model", model)
+            .putBoolean("gemini_gen", geminiBox.isChecked)
+            .apply()
+
+        val mode = modeGroup.checkedRadioButtonId
+        val userPrompt = promptBox.text.toString().trim()
+        val img = inputBitmap
+        val useGemini = mode == 3 || mode == 4 || (mode == 1 && geminiBox.isChecked)
+
+        if (useGemini && key.isEmpty()) { setStatus("حط مفتاح Gemini أولا"); return }
+        if (mode == 1 && userPrompt.isEmpty()) { setStatus("اكتب الفكرة"); return }
+        if (mode != 1 && img == null) { setStatus("اختار تصويرة أولا"); return }
+        if (mode == 3 && userPrompt.isEmpty()) { setStatus("اكتب شنو تحب تبدّل"); return }
+
+        when (mode) {
+            1 -> runAsync {
+                if (geminiBox.isChecked) callGemini(key, model, userPrompt, null)
+                else callPollinations(userPrompt)
+            }
+            2 -> runAsync { Enhancer.enhance(img!!) }
+            3 -> runAsync { callGemini(key, model, userPrompt, img) }
+            else -> runAsync {
+                callGemini(key, model, ENHANCE_PROMPT + (if (userPrompt.isNotEmpty()) " $userPrompt" else ""), img)
+            }
+        }
+    }
+
+    private fun callPollinations(prompt: String): Bitmap {
+        val encoded = URLEncoder.encode(prompt, "UTF-8").replace("+", "%20")
+        val seed = System.currentTimeMillis() % 100000
+        val url = "https://image.pollinations.ai/prompt/$encoded?width=1024&height=1024&model=flux&nologo=true&seed=$seed"
+        var attempt = 0
+        while (true) {
+            attempt++
+            val conn = URL(url).openConnection() as HttpURLConnection
+            conn.connectTimeout = 30000
+            conn.readTimeout = 180000
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+            val code = conn.responseCode
+            if (code in 200..299) {
+                val bytes = conn.inputStream.use { it.readBytes() }
+                conn.disconnect()
+                return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    ?: throw Exception("السيرفر ما رجّعش صورة")
+            }
+            val err = conn.errorStream?.bufferedReader()?.readText() ?: ""
+            conn.disconnect()
+            if ((code == 429 || code == 502 || code == 503 || code == 504) && attempt < MAX_TRIES) {
+                for (s in 20 downTo 1) {
+                    setStatusAsync("السيرفر المجاني مشغول (كود $code). نعاود بعد $s ثانية - محاولة $attempt/$MAX_TRIES")
+                    Thread.sleep(1000)
+                }
+                continue
+            }
+            throw Exception("HTTP $code: ${err.take(200)}")
         }
     }
 
@@ -206,6 +265,9 @@ class MainActivity : Activity() {
             conn.disconnect()
 
             if (code in 200..299) return parseImage(text)
+            if (code == 429 && (text.contains("limit: 0") || text.contains("\"quotaValue\": \"0\""))) {
+                throw Exception("الموديل هذا ما عندوش حصة مجانية (limit 0). استعمل الأوضاع المجانية ولا بدّل الموديل ولا فعّل الدفع.")
+            }
             if ((code == 429 || code == 503) && attempt < MAX_TRIES) {
                 for (s in 30 downTo 1) {
                     setStatusAsync("الخادم مشغول (كود $code). نعاود بعد $s ثانية - محاولة $attempt/$MAX_TRIES")
@@ -245,5 +307,110 @@ class MainActivity : Activity() {
         if (uri == null) { setStatus("ما نجمتش نحفظ"); return }
         contentResolver.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
         setStatus("تحفظت في المعرض (Pictures/AIImage)")
+    }
+}
+
+object Enhancer {
+
+    fun enhance(src: Bitmap): Bitmap {
+        val w = src.width
+        val h = src.height
+        val px = IntArray(w * h)
+        src.getPixels(px, 0, w, 0, 0, w, h)
+        autoLevels(px)
+        saturate(px, 1.12f)
+        val out = unsharp(px, w, h, 2, 0.7f)
+        return Bitmap.createBitmap(out, w, h, Bitmap.Config.ARGB_8888)
+    }
+
+    private fun autoLevels(px: IntArray) {
+        val hist = IntArray(256)
+        for (p in px) {
+            val l = (0.299 * ((p shr 16) and 255) + 0.587 * ((p shr 8) and 255) + 0.114 * (p and 255)).toInt()
+            hist[l]++
+        }
+        val clip = px.size / 100
+        var acc = 0
+        var lo = 0
+        while (lo < 255 && acc + hist[lo] <= clip) { acc += hist[lo]; lo++ }
+        acc = 0
+        var hi = 255
+        while (hi > 0 && acc + hist[hi] <= clip) { acc += hist[hi]; hi-- }
+        if (hi - lo < 50) return
+        val scale = 255f / (hi - lo)
+        var sum = 0L
+        for (i in 0..255) sum += i.toLong() * hist[i]
+        val mean = sum.toFloat() / px.size
+        val gamma = if (mean < 110f) 0.85 else 1.0
+        val lut = IntArray(256) { v ->
+            val x = ((v - lo) * scale).coerceIn(0f, 255f) / 255f
+            val y = Math.pow(x.toDouble(), gamma).toFloat()
+            (y * 255f + 0.5f).toInt().coerceIn(0, 255)
+        }
+        for (i in px.indices) {
+            val p = px[i]
+            val r = lut[(p shr 16) and 255]
+            val g = lut[(p shr 8) and 255]
+            val b = lut[p and 255]
+            px[i] = (p and (0xFF shl 24)) or (r shl 16) or (g shl 8) or b
+        }
+    }
+
+    private fun saturate(px: IntArray, s: Float) {
+        for (i in px.indices) {
+            val p = px[i]
+            val r = (p shr 16) and 255
+            val g = (p shr 8) and 255
+            val b = p and 255
+            val l = 0.299f * r + 0.587f * g + 0.114f * b
+            val nr = (l + (r - l) * s).toInt().coerceIn(0, 255)
+            val ng = (l + (g - l) * s).toInt().coerceIn(0, 255)
+            val nb = (l + (b - l) * s).toInt().coerceIn(0, 255)
+            px[i] = (p and (0xFF shl 24)) or (nr shl 16) or (ng shl 8) or nb
+        }
+    }
+
+    private fun unsharp(px: IntArray, w: Int, h: Int, radius: Int, amount: Float): IntArray {
+        val out = IntArray(px.size) { 0xFF shl 24 }
+        val chan = IntArray(px.size)
+        val tmp = IntArray(px.size)
+        val blur = IntArray(px.size)
+        for (c in 0..2) {
+            val shift = 16 - 8 * c
+            for (i in px.indices) chan[i] = (px[i] shr shift) and 255
+            boxBlur(chan, tmp, blur, w, h, radius)
+            for (i in px.indices) {
+                val o = chan[i]
+                val diff = o - blur[i]
+                val v = if (abs(diff) < 3) o else (o + amount * diff).toInt().coerceIn(0, 255)
+                out[i] = out[i] or (v shl shift)
+            }
+        }
+        return out
+    }
+
+    private fun boxBlur(src: IntArray, tmp: IntArray, dst: IntArray, w: Int, h: Int, r: Int) {
+        val d = 2 * r + 1
+        for (y in 0 until h) {
+            val row = y * w
+            var sum = 0
+            for (x in -r..r) sum += src[row + x.coerceIn(0, w - 1)]
+            for (x in 0 until w) {
+                tmp[row + x] = sum / d
+                val add = (x + r + 1).coerceAtMost(w - 1)
+                val rem = (x - r).coerceAtLeast(0)
+                sum += src[row + add] - src[row + rem]
+            }
+        }
+        for (x in 0 until w) {
+            var sum = 0
+            for (y in -r..r) sum += tmp[y.coerceIn(0, h - 1) * w + x]
+            for (y in 0 until h) {
+                dst[y * w + x] = sum / d
+                val add = (y + r + 1).coerceAtMost(h - 1)
+                val rem = (y - r).coerceAtLeast(0)
+                sum += tmp[add * w + x] - tmp[rem * w + x]
+            }
+        }
     }
 }
