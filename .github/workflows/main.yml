@@ -7,6 +7,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Apply update.zip if present
+        run: |
+          if [ -f update.zip ]; then
+            unzip -o update.zip
+          fi
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
