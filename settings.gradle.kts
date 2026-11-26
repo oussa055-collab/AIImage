@@ -4,5 +4,5 @@ pluginManagement {
 dependencyResolutionManagement {
     repositories { google(); mavenCentral() }
 }
-rootProject.name = "AIImage"
+rootProject.name = "ManhuaSRT"
 include(":app")
